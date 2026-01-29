@@ -283,8 +283,6 @@ class Qwen3Attention(nn.Module):
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-    
-          
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -341,14 +339,20 @@ class Qwen3Attention(nn.Module):
         kv_seq_len = key_states.shape[2]
         # print(f"kv_seq_len: {kv_seq_len}")
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # Group queries by KV heads and compute mean for mask generation
+        # query_states: (bsz, num_heads, q_len, head_dim) -> (bsz, num_kv_heads, num_kv_groups, q_len, head_dim)
+        q_grouped = query_states.reshape(bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, self.head_dim)
+        mean_query = q_grouped.mean(dim=2)  # (bsz, num_kv_heads, q_len, head_dim)
+        del q_grouped  # Free memory
 
-        # Compute sign in-place friendly way
-        sign = query_states.sign()
+        # Compute sign in-place friendly way (at KV-head level)
+        sign = mean_query.sign()
         sign[sign == 0] = 1  # Handle zeros
-        max_key = key_states * sign
-        positive_query = query_states * sign
+        positive_query = mean_query * sign
+        del mean_query  # Free memory
+
+        # Compute max_key using original key_states (before expansion)
+        max_key = key_states * sign  # (bsz, num_kv_heads, kv_seq_len, head_dim)
         del sign  # Free memory
 
         # Pad max_key to be divisible by chunk_size using F.pad (more memory efficient than torch.cat)
@@ -359,7 +363,7 @@ class Qwen3Attention(nn.Module):
                 max_key, (0, 0, 0, padding_length), value=torch.finfo(max_key.dtype).min
             )
 
-        # Chunk max_key into chunk_size tokens and get max
+        # Chunk max_key into chunk_size tokens
         chunk_max_key = max_key.reshape(
             max_key.shape[0],
             max_key.shape[1],
@@ -372,16 +376,21 @@ class Qwen3Attention(nn.Module):
         # Duplicate chunk_max_key chunk_size times (use repeat_interleave for memory efficiency)
         chunk_max_key = chunk_max_key.repeat_interleave(self.chunk_size, dim=-2)[:, :, :seq_length, :]
 
+        # Compute quantized_weight at KV-head level
         # Keep in bfloat16 - sufficient precision for mask generation (top-k selection)
         with torch.no_grad():
             quantized_weight = torch.matmul(
                 positive_query,
                 chunk_max_key.transpose(2, 3),
-            )
+            )  # (bsz, num_kv_heads, q_len, kv_seq_len)
             del positive_query, chunk_max_key  # Free memory
 
-            # Recompute attn_weights (allows max_key memory to be freed first)
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            # Now expand key_states and value_states for actual attention computation
+            key_states_expanded = repeat_kv(key_states, self.num_key_value_groups)
+            value_states_expanded = repeat_kv(value_states, self.num_key_value_groups)
+
+            # Recompute attn_weights (allows intermediate memory to be freed first)
+            attn_weights = torch.matmul(query_states, key_states_expanded.transpose(2, 3)) / math.sqrt(self.head_dim)
 
             if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
                 raise ValueError(
@@ -399,18 +408,26 @@ class Qwen3Attention(nn.Module):
                 
                 quantized_weight.add_(attention_mask)
                 quantized_weight.clamp_(min=torch.finfo(quantized_weight.dtype).min)
-                
+
             token_budget = min(kv_seq_len, self.token_budget)
 
+            # Generate mask at KV-head level
             if token_budget > 0:
-                mask_bottom = local_heavy_hitter_mask(
+                mask_bottom_kv = local_heavy_hitter_mask(
                     quantized_weight, token_budget, self.chunk_size
-                )  # Default: No padding applied to input
+                )  # (bsz, num_kv_heads, q_len, kv_seq_len)
             else:
-                mask_bottom = torch.zeros_like(quantized_weight, dtype=torch.bool)
+                mask_bottom_kv = torch.zeros_like(quantized_weight, dtype=torch.bool)
             del quantized_weight  # Free memory
 
-        mask_bottom = torch.tril(mask_bottom, diagonal=position_ids[0][0].item())
+        mask_bottom_kv = torch.tril(mask_bottom_kv, diagonal=position_ids[0][0].item())
+
+        # Expand mask to all heads (same mask for queries sharing the same KV)
+        mask_bottom = mask_bottom_kv.unsqueeze(2).expand(
+            bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, kv_seq_len
+        ).reshape(bsz, self.num_heads, q_len, kv_seq_len)
+        del mask_bottom_kv  # Free memory
+
         attn_weights[~mask_bottom] = torch.finfo(attn_weights.dtype).min
         del mask_bottom  # Free memory
 
@@ -420,14 +437,14 @@ class Qwen3Attention(nn.Module):
         )
 
         with torch.no_grad():
-            attn_output = torch.matmul(attn_weights, value_states)
+            attn_output = torch.matmul(attn_weights, value_states_expanded)
+
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
-
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
