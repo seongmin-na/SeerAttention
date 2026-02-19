@@ -4,6 +4,7 @@ import os
 import sys
 import argparse
 import time
+import json
 from collections import deque # Use deque for efficient pop/append
 
 
@@ -11,9 +12,9 @@ def choose_task_config(model_size, output_dir):
     output_dir = output_dir.lower()
     if model_size != "32B":
         task_config = {
-            "aime24": {"bs": 15, "total_run": 64},
-            "aime25": {"bs": 15, "total_run": 64},
-            "math": {"bs": 75, "total_run": 8},
+            "aime24": {"bs": 3, "total_run": 1},
+            "aime25": {"bs": 3, "total_run": 1},
+            "math": {"bs": 10, "total_run": 1},
             "gpqa": {"bs": 30, "total_run": 16},
             "olympiadbench": {"bs": 15, "total_run": 8},
             "livecodebench": {"bs": 15, "total_run": 8},
@@ -26,18 +27,18 @@ def choose_task_config(model_size, output_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run tasks using subprocess.")
     parser.add_argument("--model_dir", type=str,
-                        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+                        default="qwen3-4b-seer",
                         help="Model directory path")
     parser.add_argument("--model_size", type=str, default="14B", help="model_size")
-    parser.add_argument("--tasks", type=str, default="aime",
+    parser.add_argument("--tasks", type=str, default="aime24",
                         help="Comma-separated list of tasks (e.g., aime,math,gpqa)")
-    parser.add_argument("--output_dir", type=str, default="./results/aime",
+    parser.add_argument("--output_dir", type=str, default="./results//use/",
                         help="Directory to store output results")
     parser.add_argument("--attention_implementation", type=str, default="seer_sparse",
                         help="attention implementations")
     parser.add_argument("--limit", type=int, default=-1,
                         help="Limit for the number of samples to process")
-    parser.add_argument("--num_gpus", default="8", type=int)
+    parser.add_argument("--num_gpus", default="1", type=int)
     parser.add_argument("--block_size", default="64", type=str)
     parser.add_argument("--sparsity_method", default='threshold', choices=["token_budget", "threshold"], type=str)
     parser.add_argument("--sliding_window_size", default="0", type=str)
@@ -49,11 +50,23 @@ if __name__ == "__main__":
                         help="Flag to profile sparsity in eval.py")
     args = parser.parse_args()
 
+    # Load model mapping from config
+    config_path = "./config/model2path.json"
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            model2path = json.load(f)
+        # Resolve model_dir from config if it's a key
+        if args.model_dir in model2path:
+            model_dir = model2path[args.model_dir]
+            print(f"Resolved '{args.model_dir}' to '{model_dir}' from config")
+        else:
+            model_dir = args.model_dir
+    else:
+        model_dir = args.model_dir
+
     limit = args.limit
     num_gpus = args.num_gpus
     max_tokens = args.max_tokens
-
-    model_dir = args.model_dir
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     sparsity_method = args.sparsity_method
     token_budgets = [t.strip() for t in args.token_budget.split(",") if t.strip()]
@@ -149,7 +162,8 @@ if __name__ == "__main__":
                         print(f"Launching run {current_run_id} on GPU {gpu_id}...")
                         
                         env = os.environ.copy()
-                        # env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+                        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
                         cmd = [
                             "python", "eval_hf.py",
                             "--model_name_or_path", model_dir,

@@ -40,6 +40,29 @@ dataset2metric = {
     "repobench-p": code_sim_score,
 }
 
+# List of known dataset names for parsing
+KNOWN_DATASETS = list(dataset2metric.keys())
+
+
+def parse_filename(filename):
+    """
+    Parse filename to extract dataset name and config suffix.
+    E.g., 'qasper_tb512_bs64.jsonl' -> ('qasper', '_tb512_bs64')
+          'qasper.jsonl' -> ('qasper', '')
+    """
+    basename = os.path.splitext(filename)[0]  # Remove .jsonl
+
+    # Try to match known dataset names
+    for dataset in sorted(KNOWN_DATASETS, key=len, reverse=True):  # Longest first
+        if basename == dataset:
+            return dataset, ""
+        if basename.startswith(dataset + "_"):
+            suffix = basename[len(dataset):]
+            return dataset, suffix
+
+    # Fallback: assume no suffix (original behavior)
+    return basename, ""
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None, help="Model name (ends with -t or -n for thinking mode)")
@@ -121,53 +144,77 @@ def calculate_averaged_scores(all_scores):
         averaged_results[key] = round(np.mean(values), 2) if values else 0.0
     return averaged_results
 
-if __name__ == '__main__':
-    args = parse_args()
-    root = f"pred_e/{args.model}" if args.e else f"pred/{args.model}"
+def evaluate_model(model_path, use_e_mode):
+    """Evaluate a single model directory."""
+    model_name = os.path.basename(model_path)
 
     # 모델명 접미사를 확인하여 thinking_mode 설정
     thinking_mode = False
-    if args.model and (args.model.endswith(("-t", "-n"))):
+    if model_name.endswith(("-t", "-n")) or "-t_" in model_name or "-n_" in model_name:
         thinking_mode = True
-        print(f">>> Thinking Mode Detected for model: {args.model}")
+        print(f">>> Thinking Mode Detected for model: {model_name}")
 
-    if not os.path.isdir(root):
-        raise FileNotFoundError(f"Directory not found: {root}")
+    all_files = [f for f in os.listdir(model_path) if f.endswith(".jsonl")]
+    print(f"[{model_path}] files:", all_files)
 
-    config_dirs = [root]
-    print("Evaluate configs:", config_dirs)
+    scores = dict()
+    for filename in all_files:
+        predictions, answers, lengths = [], [], []
+        dataset, suffix = parse_filename(filename)
+        # Use full name (dataset + suffix) as key, e.g., "qasper_tb2048"
+        result_key = f"{dataset}{suffix}"
 
-    for path in config_dirs:
-        all_files = [f for f in os.listdir(path) if f.endswith(".jsonl")]
-        print(f"[{path}] files:", all_files)
+        with open(os.path.join(model_path, filename), "r", encoding="utf-8") as f:
+            for line in f:
+                data = json.loads(line)
+                predictions.append(data["pred"])
+                answers.append(data["answers"])
+                all_classes = data["all_classes"]
+                if "length" in data:
+                    lengths.append(data["length"])
 
-        scores = dict()
-        for filename in all_files:
-            predictions, answers, lengths = [], [], []
-            dataset = os.path.splitext(filename)[0]
-            
-            with open(os.path.join(path, filename), "r", encoding="utf-8") as f:
-                for line in f:
-                    data = json.loads(line)
-                    predictions.append(data["pred"])
-                    answers.append(data["answers"])
-                    all_classes = data["all_classes"]
-                    if "length" in data:
-                        lengths.append(data["length"])
-            
-            # scorer 호출 시 thinking_mode 인자 전달
-            if args.e:
-                score, missing_think_close = scorer_e(dataset, predictions, answers, lengths, all_classes, thinking_mode=thinking_mode)
-            else:
-                score, missing_think_close = scorer(dataset, predictions, answers, all_classes, thinking_mode=thinking_mode)
+        # scorer 호출 시 thinking_mode 인자 전달
+        if use_e_mode:
+            score, missing_think_close = scorer_e(dataset, predictions, answers, lengths, all_classes, thinking_mode=thinking_mode)
+        else:
+            score, missing_think_close = scorer(dataset, predictions, answers, all_classes, thinking_mode=thinking_mode)
 
-            scores[dataset] = score
-            print(f"Done: {dataset}")
-            if thinking_mode and missing_think_close > 0:
-                print(f"  -> Missing </think> tag: {missing_think_close}/{len(predictions)}")
+        scores[result_key] = score
+        print(f"Done: {result_key}")
+        if thinking_mode and missing_think_close > 0:
+            print(f"  -> Missing </think> tag: {missing_think_close}/{len(predictions)}")
 
-        # 결과를 result.json 파일로 저장
-        out_path = os.path.join(path, "result.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(scores, f, ensure_ascii=False, indent=4)
-        print(f"[{path}] wrote results to: {out_path}")
+    # 결과를 result.json 파일로 저장
+    out_path = os.path.join(model_path, "result.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(scores, f, ensure_ascii=False, indent=4)
+    print(f"[{model_path}] wrote results to: {out_path}")
+
+if __name__ == '__main__':
+    args = parse_args()
+    base_dir = "pred_e" if args.e else "pred"
+
+    if args.model:
+        # Evaluate a specific model
+        root = os.path.join(base_dir, args.model)
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"Directory not found: {root}")
+        model_dirs = [root]
+    else:
+        # Evaluate all models in the base directory
+        if not os.path.isdir(base_dir):
+            raise FileNotFoundError(f"Directory not found: {base_dir}")
+        model_dirs = [
+            os.path.join(base_dir, d) for d in sorted(os.listdir(base_dir))
+            if os.path.isdir(os.path.join(base_dir, d))
+        ]
+        if not model_dirs:
+            raise FileNotFoundError(f"No model directories found in: {base_dir}")
+
+    print("Evaluate configs:", model_dirs)
+
+    for model_path in model_dirs:
+        print(f"\n{'='*50}")
+        print(f"Evaluating: {model_path}")
+        print(f"{'='*50}")
+        evaluate_model(model_path, args.e)

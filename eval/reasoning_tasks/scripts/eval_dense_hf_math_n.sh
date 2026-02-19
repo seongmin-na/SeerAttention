@@ -1,10 +1,10 @@
-# model_dir="Qwen/Qwen3-4B-Thinking-2507"
-model_dir="Qwen/Qwen3-4B-Instruct-2507"
+model_dir="Qwen/Qwen3-4B"
 output_dir="./result_dense"
+# attention_implementation="quest"
 attention_implementation="fa2"
 max_tokens=32768
-num_gpus=8
-limit=16
+num_gpus=1
+limit=128
 
 # tasks="aime24,aime25,math,gpqa"
 tasks="math"

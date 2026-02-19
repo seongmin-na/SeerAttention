@@ -221,6 +221,50 @@ def block_sparse_flash_decode_leftpad_gqa_mask(
     num_m_blocks = 1 * (heads // heads_kv + block_H - 1) // block_H
     num_n_blocks = max_selected_blocks
 
+    # Debug: Sparsity statistics and block positions
+    debug=False
+    if debug:
+        print("\n" + "="*60)
+        print("BLOCK MASK DEBUG INFO")
+        print("="*60)
+
+        # Per-batch, per-head statistics
+        selected_counts = block_mask.sum(dim=-1)  # (batch, heads_kv)
+        total_selected = block_mask.sum().item()
+        total_blocks = batch * heads_kv * max_selected_blocks
+        overall_sparsity = 1.0 - (total_selected / total_blocks)
+
+        print(f"\nOverall sparsity: {overall_sparsity:.2%} ({total_selected}/{total_blocks} blocks selected)")
+        print(f"Block mask shape: {block_mask.shape}")
+
+        # Per-batch statistics
+        print(f"\nPer-batch selected blocks (summed over heads_kv):")
+        batch_counts = block_mask.sum(dim=(1, 2))  # (batch,)
+        for b in range(batch):
+            cache_len = cache_seqlens[b].item()
+            valid_blocks = (cache_len + block_size - 1) // block_size
+            leftpad_blocks = (max_cache_seqlen - cache_len) // block_size
+            print(f"  Batch {b}: {batch_counts[b].item():.0f} selected, "
+                  f"cache_len={cache_len}, valid_blocks={valid_blocks}, leftpad_blocks={leftpad_blocks}")
+
+        # Per-head sparsity for first batch
+        print(f"\nPer-head selected blocks (batch 0):")
+        for h in range(min(heads_kv, 8)):  # Show first 8 heads
+            count = selected_counts[0, h].item()
+            print(f"  Head {h}: {count:.0f} blocks")
+        if heads_kv > 8:
+            print(f"  ... ({heads_kv - 8} more heads)")
+
+        # Show actual block positions for first batch, first head
+        print(f"\nSelected block indices (batch 0, head 0):")
+        selected_indices = torch.where(block_mask[0, 0])[0].tolist()
+        if len(selected_indices) <= 20:
+            print(f"  Indices: {selected_indices}")
+        else:
+            print(f"  Indices (first 20): {selected_indices[:20]} ... ({len(selected_indices)} total)")
+
+        print("="*60 + "\n")
+
     size_one_kv_head = max_selected_blocks * block_size * (
         dim + dim_v) * 2  #kv_seqlen * (dim + dim_v) * 2
     total_mblocks = batch * heads_kv * num_m_blocks

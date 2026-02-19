@@ -24,6 +24,18 @@ def get_quest_models():
     from quest_modeling.modeling_qwen3_quest import Qwen3ForCausalLM as QuestQwen3ForCausalLM
     return QuestQwen2ForCausalLM, QuestQwen3ForCausalLM
 
+def get_request_models():
+    from quest_modeling.modeling_qwen3_request import Qwen3ForCausalLM as RequestQwen3ForCausalLM
+    return RequestQwen3ForCausalLM
+
+def get_lim_models():
+    from quest_modeling.modeling_qwen3_lim import Qwen3ForCausalLM as LimQwen3ForCausalLM
+    return LimQwen3ForCausalLM
+
+def get_tidal_models():
+    from quest_modeling.modeling_qwen3_tidal import Qwen3ForCausalLM as TidalQwen3ForCausalLM
+    return TidalQwen3ForCausalLM
+
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -33,7 +45,7 @@ def parse_args(args=None):
     parser.add_argument('--output_dir', type=str, default='./', help="Output directory")
     # Attention implementation arguments
     parser.add_argument('--attention_implementation', type=str, default='default',
-                        choices=['default', 'oracle_sparse', 'quest', 'fa2'])
+                        choices=['default', 'oracle_sparse', 'quest', 'request', 'lim', 'tidal', 'fa2'])
     parser.add_argument('--sparsity_method', type=str, default='token_budget',
                         choices=['token_budget', 'threshold'])
     parser.add_argument('--threshold', type=float, default=0.0)
@@ -41,6 +53,11 @@ def parse_args(args=None):
     parser.add_argument('--start_layer', type=int, default=0)
     parser.add_argument('--block_size', type=int, default=64)
     parser.add_argument('--sliding_window_size', type=int, default=0)
+    parser.add_argument('--static_ratio', type=float, default=0.0,
+                        help="Ratio of static prefix/suffix tokens for quest attention (0.0 to 1.0)")
+    parser.add_argument('--sanity_n', type=int, default=None, help="Number of samples per length bucket for sanity check")
+    parser.add_argument('--prefix', type=str, default='', help="Prefix to prepend to the output directory name")
+    parser.add_argument('--force', action='store_true', help="Delete existing result files and rerun")
     return parser.parse_args(args)
 
 
@@ -104,16 +121,60 @@ def load_model_and_tokenizer(path, device, args):
             model = QuestQwen3ForCausalLM.from_pretrained(
                 path, trust_remote_code=True, torch_dtype=torch.bfloat16,
                 device_map=device, chunk_size=args.block_size,
-                token_budget=args.token_budget, start_layer=args.start_layer
+                token_budget=args.token_budget, start_layer=args.start_layer,
+                static_ratio=args.static_ratio
             )
         elif "qwen" in model_name_lower:
             model = QuestQwen2ForCausalLM.from_pretrained(
                 path, trust_remote_code=True, torch_dtype=torch.bfloat16,
                 device_map=device, chunk_size=args.block_size,
-                token_budget=args.token_budget, start_layer=args.start_layer
+                token_budget=args.token_budget, start_layer=args.start_layer,
+                static_ratio=args.static_ratio
             )
         else:
             raise ValueError(f"Quest not supported for {path}")
+        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="left")
+
+    elif args.attention_implementation == 'request':
+        RequestQwen3ForCausalLM = get_request_models()
+
+        if "qwen3" in model_name_lower:
+            model = RequestQwen3ForCausalLM.from_pretrained(
+                path, trust_remote_code=True, torch_dtype=torch.bfloat16,
+                device_map=device, chunk_size=args.block_size,
+                token_budget=args.token_budget, start_layer=args.start_layer,
+                static_ratio=args.static_ratio
+            )
+        else:
+            raise ValueError(f"Request not supported for {path}, only Qwen3 models are supported")
+        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="left")
+
+    elif args.attention_implementation == 'lim':
+        LimQwen3ForCausalLM = get_lim_models()
+
+        if "qwen3" in model_name_lower:
+            model = LimQwen3ForCausalLM.from_pretrained(
+                path, trust_remote_code=True, torch_dtype=torch.bfloat16,
+                device_map=device, chunk_size=args.block_size,
+                token_budget=args.token_budget, start_layer=args.start_layer,
+                static_ratio=args.static_ratio
+            )
+        else:
+            raise ValueError(f"Lim not supported for {path}, only Qwen3 models are supported")
+        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="left")
+
+    elif args.attention_implementation == 'tidal':
+        TidalQwen3ForCausalLM = get_tidal_models()
+
+        if "qwen3" in model_name_lower:
+            model = TidalQwen3ForCausalLM.from_pretrained(
+                path, trust_remote_code=True, torch_dtype=torch.bfloat16,
+                device_map=device, chunk_size=args.block_size,
+                token_budget=args.token_budget, start_layer=args.start_layer,
+                static_ratio=args.static_ratio
+            )
+        else:
+            raise ValueError(f"Tidal not supported for {path}, only Qwen3 models are supported")
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="left")
 
     elif args.attention_implementation == 'fa2':
@@ -211,22 +272,80 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def select_sanity_per_bucket(data, n_per_bucket: int, seed: int = 42):
+    """Sample n_per_bucket examples per length bucket for sanity testing."""
+    buckets = {"0-4k": [], "4-8k": [], "8k+": []}
+    for i, ex in enumerate(data):
+        L = int(ex.get("length", 0))
+        if L < 4096:
+            buckets["0-4k"].append(i)
+        elif L < 8192:
+            buckets["4-8k"].append(i)
+        else:
+            buckets["8k+"].append(i)
+
+    rng = np.random.default_rng(seed)
+    selected = []
+    for _, idxs in buckets.items():
+        if not idxs:
+            continue
+        k = min(n_per_bucket, len(idxs))
+        chosen = rng.choice(idxs, size=k, replace=False)
+        selected.extend(chosen.tolist())
+
+    # Sort to stabilize order
+    return data.select(sorted(selected))
+
+
 def get_output_model_name(args):
-    """Generate output directory name based on attention implementation."""
+    """Generate output directory name based on model and attention implementation."""
     model_name = args.model.split("/")[-1]
+    prefix = args.prefix if args.prefix else ""
 
     if args.attention_implementation == 'default':
-        return model_name
-    elif args.attention_implementation == 'quest':
-        return f"{model_name}_quest_tb{args.token_budget}_bs{args.block_size}"
-    elif args.attention_implementation == 'oracle_sparse':
-        if args.sparsity_method == 'threshold':
-            return f"{model_name}_oracle_{args.threshold}"
-        else:
-            return f"{model_name}_oracle_tb{args.token_budget}"
+        base = model_name
     elif args.attention_implementation == 'fa2':
-        return f"{model_name}_fa2"
-    return model_name
+        base = f"{model_name}_fa2"
+    elif args.attention_implementation in ['quest', 'request', 'lim', 'tidal', 'oracle_sparse']:
+        # For sparse methods, just use model_name + method as folder
+        base = f"{model_name}_{args.attention_implementation}"
+    else:
+        base = model_name
+
+    return f"{prefix}{base}" if prefix else base
+
+
+def get_output_file_suffix(args):
+    """Generate file suffix based on sparse attention parameters."""
+    if args.attention_implementation in ['default', 'fa2']:
+        return ""
+
+    suffix_parts = []
+
+    if args.attention_implementation == 'oracle_sparse':
+        if args.sparsity_method == 'threshold':
+            suffix_parts.append(f"th{args.threshold}")
+        else:
+            suffix_parts.append(f"tb{args.token_budget}")
+    elif args.attention_implementation in ['quest', 'request', 'lim', 'tidal']:
+        suffix_parts.append(f"tb{args.token_budget}")
+
+    # Common parameters for sparse methods
+    if args.block_size != 16:  # Only add if non-default
+        suffix_parts.append(f"bs{args.block_size}")
+
+    if args.sliding_window_size > 0:
+        suffix_parts.append(f"sw{args.sliding_window_size}")
+
+    if args.static_ratio > 0:
+        suffix_parts.append(f"sr{args.static_ratio}")
+
+    if args.start_layer != 2:
+        suffix_parts.append(f"sl{args.start_layer}")
+
+    if suffix_parts:
+        return "_" + "_".join(suffix_parts)
+    return ""
 
 
 if __name__ == '__main__':
@@ -267,6 +386,7 @@ if __name__ == '__main__':
 
     # Setup output directories
     output_model_name = get_output_model_name(args)
+    file_suffix = get_output_file_suffix(args)
     pred_dir = os.path.join(args.output_dir, "pred_e" if args.e else "pred", output_model_name)
     os.makedirs(pred_dir, exist_ok=True)
 
@@ -277,12 +397,21 @@ if __name__ == '__main__':
         else:
             data = load_dataset('THUDM/LongBench', dataset, split='test')
 
-        out_path = os.path.join(pred_dir, f"{dataset}.jsonl")
+        # Apply sanity sampling if specified
+        if args.sanity_n is not None and args.sanity_n>0:
+            data = select_sanity_per_bucket(data, args.sanity_n, seed=42)
+            print(f"Sanity mode: selected {len(data)} samples ({args.sanity_n} per bucket)")
+
+        out_path = os.path.join(pred_dir, f"{dataset}{file_suffix}.jsonl")
 
         # Skip if already exists
         if os.path.exists(out_path):
-            print(f"Skipping {dataset}, output already exists")
-            continue
+            if args.force:
+                os.remove(out_path)
+                print(f"Deleted existing output for {dataset}, rerunning")
+            else:
+                print(f"Skipping {dataset}, output already exists")
+                continue
 
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]

@@ -21,6 +21,7 @@ from math import comb
 from seer_attn import SeerDecodingQwen2ForCausalLM, SeerDecodingQwen3ForCausalLM
 from quest_modeling.modeling_qwen2_quest import Qwen2ForCausalLM as QuestQwen2ForCausalLM
 from quest_modeling.modeling_qwen3_quest import Qwen3ForCausalLM as QuestQwen3ForCausalLM
+from quest_modeling.modeling_qwen3_request import Qwen3ForCausalLM as ReQuestQwen3ForCausalLM
 from generation_utils import batch_exist_generate
 from typing import Optional, Tuple
 
@@ -93,11 +94,13 @@ def parse_args():
     parser.add_argument("--start_layer", default=0, type=int)
     parser.add_argument("--block_size", default=64, type=int)
     parser.add_argument("--rank", default=0, type=int)
-    parser.add_argument("--attention_implementation", default="seer_sparse", choices=["seer_sparse", "seer_dense", "oracle_sparse", "quest", "fa2", "sdpa"], type=str)
+    parser.add_argument("--attention_implementation", default="seer_sparse", choices=["seer_sparse", "seer_dense", "oracle_sparse", "quest", "request", "fa2", "sdpa"], type=str)
     parser.add_argument("--use_batch_exist", action="store_true")
     parser.add_argument("--use_fused_kernel", action="store_true")
     parser.add_argument("--profile_sparsity", action="store_true")
     parser.add_argument("--run_id", default=0, type=int)
+    parser.add_argument("--start_index", default=0, type=int, help="Start index for dataset slicing (for batch parallelization)")
+    parser.add_argument("--end_index", default=-1, type=int, help="End index for dataset slicing (for batch parallelization, -1 means no limit)")
     args = parser.parse_args()
     
     return args
@@ -141,6 +144,8 @@ def infer(args):
     print(args)
     model_name_or_path = args.model_name_or_path
     print(f"current eval model: {model_name_or_path}")
+    # Each process sees only its assigned GPU via CUDA_VISIBLE_DEVICES, so use cuda:0
+    print(f"device rank : {args.rank}")
     device = f"cuda:{args.rank}"
 
     generate_lens = []
@@ -150,12 +155,18 @@ def infer(args):
     limit = args.limit
     if limit > 0:
         examples = examples[:limit]
-    
+
+    # Apply start_index and end_index for batch parallelization
+    if args.end_index > 0:
+        examples = examples[args.start_index:args.end_index]
+    elif args.start_index > 0:
+        examples = examples[args.start_index:]
+
     if args.profile_sparsity:
         assert args.attention_implementation in ["seer_sparse", "oracle_sparse"], "profile_sparsity only support seer_sparse and oracle_sparse"
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
-    
+
     if args.attention_implementation == "seer_sparse": 
         base_model = config.base_model
         tokenizer = AutoTokenizer.from_pretrained(
@@ -272,6 +283,13 @@ def infer(args):
             )
         else:
             raise ValueError(f"model: {model_name_or_path} not supported in Quest")
+    elif args.attention_implementation == "request":
+        if "qwen3" in model_name_or_path.lower():
+            model = ReQuestQwen3ForCausalLM.from_pretrained(
+                model_name_or_path, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map=device, chunk_size=args.block_size, token_budget=args.token_budget, start_layer=args.start_layer
+            )
+        else:
+            raise ValueError(f"model: {model_name_or_path} not supported in ReQuest (only Qwen3 supported)")
     elif args.attention_implementation == "fa2":
         model = AutoModelForCausalLM.from_pretrained(model_name_or_path,
                                                     torch_dtype=torch.bfloat16,
@@ -392,7 +410,7 @@ def infer(args):
             "total_time": total_time,
             "overall_sparsity": overall_sparsity_ratio,
         }
-    elif args.attention_implementation == "quest":
+    elif args.attention_implementation in ["quest", "request"]:
         other_info = {
             "generate_lens": generate_lens,
             "total_time": total_time,

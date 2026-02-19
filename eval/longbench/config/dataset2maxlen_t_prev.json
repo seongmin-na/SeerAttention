@@ -1,0 +1,23 @@
+{
+    "narrativeqa": 2048,
+    "qasper": 2048,
+    "multifieldqa_en": 1024,
+    "multifieldqa_zh": 512,
+    "hotpotqa": 512,
+    "2wikimqa": 512,
+    "musique": 512,
+    "dureader": 2048,
+    "gov_report": 4096,
+    "qmsum": 4096,
+    "multi_news": 4096,
+    "vcsum": 4096,
+    "trec": 512,
+    "triviaqa": 512,
+    "samsum": 2048,
+    "lsht": 1024,
+    "passage_count": 512,
+    "passage_retrieval_en": 512,
+    "passage_retrieval_zh": 512,
+    "lcc": 1024,
+    "repobench-p": 1024
+}

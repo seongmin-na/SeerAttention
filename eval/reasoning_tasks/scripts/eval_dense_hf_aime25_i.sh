@@ -3,11 +3,11 @@ model_dir="Qwen/Qwen3-4B-Instruct-2507"
 output_dir="./result_dense"
 attention_implementation="fa2"
 max_tokens=32768
-num_gpus=8
-limit=16
+num_gpus=2
+limit=-1
 
 # tasks="aime24,aime25,math,gpqa"
-tasks="math"
+tasks="aime25"
 
 python parallel_run_hf.py \
       --model_dir "$model_dir" \

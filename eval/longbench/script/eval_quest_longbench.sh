@@ -1,15 +1,15 @@
-model_path="SeerAttention/SeerAttention-Llama-3.1-8B-AttnGates"
+model_path="Qwen3/Qwen3-4b"
 # change model to the path of your model if needed
 
-export PROFILE_FILE="./results/llama/8B_2e-3.txt" # Comment this line to disable profiling
+export PROFILE_FILE="./results/Qwen3-4b.txt" # Comment this line to disable profiling
 python run.py \
-    --output_dir ./results/llama \
+    --output_dir ./results/Qwen3-4b \
     --model_checkpoint $model_path \
     --threshold 2e-3 
 
 
-model_path="SeerAttention/SeerAttention-Qwen2.5-7B-AttnGates"
-export PROFILE_FILE="./results/qwen/7B_2e-3.txt" 
+model_path="Qwen3/Qwne3-4b"
+export PROFILE_FILE="./results/Qwen3-4b.txt" # Comment this line to disable profiling
 python run.py \
     --output_dir ./results/qwen \
     --model_checkpoint $model_path \

@@ -8,6 +8,7 @@ from flash_attn.bert_padding import index_put_first_axis
 from flash_attn.layers.rotary import apply_rotary_emb_func
 from seer_attn.modules.common import apply_rotary_pos_emb_single, RMSNorm, repeat_kv, repeat_kv_varlen
 from seer_attn.kernels.varlen.oracle_sparse import oracle_sparse
+from seer_attn.kernels.varlen.oracle_sparse_small_block import oracle_sparse_small_block
 
 
 import math
@@ -48,7 +49,10 @@ def compute_oracle_sparse_mask(q, k, cache_seqlens, block_attention_mask, block_
         block_sparse_mask = None
     else:
 
-        attn_weights = oracle_sparse(q, k, cache_seqlens, block_size)
+        if block_size >= 16:
+            attn_weights = oracle_sparse(q, k, cache_seqlens, block_size)
+        else:
+            attn_weights = oracle_sparse_small_block(q, k, cache_seqlens, block_size)
         
         if sparsity_method == "token_budget":
             block_sparse_mask = get_sparse_attn_mask_from_budget(attn_weights, block_budget, block_attention_mask)

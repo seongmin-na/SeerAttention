@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from seer_attn.kernels.varlen.block_sparse_flash_decode_varlen_mask_leftpad import block_sparse_flash_decode_leftpad_gqa_mask
+from seer_attn.kernels.varlen.block_sparse_flash_decode_varlen_mask_leftpad_small_block import block_sparse_flash_decode_leftpad_gqa_mask_small_block
 import os
 
 def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -147,17 +148,29 @@ def sparse_flash_attention_forward(
         )
         attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
     else:
-
-        attn_output = block_sparse_flash_decode_leftpad_gqa_mask(
-            query_states, # [batch_size, num_heads, head_dim] or [batch_size, 1, num_heads, head_dim]
-            key_states, # [batch_size, max_cache_len, num_key_value_heads, head_dim]
-            value_states, # [batch_size, max_cache_len, num_key_value_heads, head_dim]
-            cache_seqlens=cache_seqlens, # [batch_size]
-            block_mask=block_mask,
-            block_size=block_size,
-            sm_scale=softmax_scale,
-            first_block_unmasked=True,
-        )
+        # Route to small block kernel when block_size < 16
+        if block_size is not None and block_size < 16:
+            attn_output = block_sparse_flash_decode_leftpad_gqa_mask_small_block(
+                query_states,
+                key_states,
+                value_states,
+                cache_seqlens=cache_seqlens,
+                block_mask=block_mask,
+                block_size=block_size,
+                sm_scale=softmax_scale,
+                first_block_unmasked=True,
+            )
+        else:
+            attn_output = block_sparse_flash_decode_leftpad_gqa_mask(
+                query_states,
+                key_states,
+                value_states,
+                cache_seqlens=cache_seqlens,
+                block_mask=block_mask,
+                block_size=block_size,
+                sm_scale=softmax_scale,
+                first_block_unmasked=True,
+            )
 
     return attn_output
 

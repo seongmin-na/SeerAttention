@@ -168,6 +168,7 @@ class QuestQwen2Config(PretrainedConfig):
         chunk_size=64,
         token_budget=2048,
         start_layer=0,
+        static_ratio=0.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -182,6 +183,7 @@ class QuestQwen2Config(PretrainedConfig):
         self.chunk_size = chunk_size
         self.token_budget = token_budget
         self.start_layer = start_layer
+        self.static_ratio = static_ratio
 
         # for backward compatibility
         if num_key_value_heads is None:

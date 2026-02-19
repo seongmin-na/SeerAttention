@@ -43,6 +43,85 @@ from transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, can_return_tuple, is_torch_flex_attn_available, logging
 from .configuration_qwen3_quest import QuestQwen3Config
 import math
+from typing import Dict
+
+# Optional: prediction tracking (only if available)
+try:
+    import sys
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../'))
+    import reuse_utils as reuse_util
+except Exception:
+    reuse_util = None
+
+# Global state for cross-layer mask sharing (for layer similarity tracking)
+_LAYER_MASK_CACHE: Dict[int, torch.Tensor] = {}  # layer_idx -> topk_chunk_indices
+
+
+def _reset_layer_mask_cache():
+    """Reset the layer mask cache (call at beginning of each generation step)."""
+    global _LAYER_MASK_CACHE
+    _LAYER_MASK_CACHE.clear()
+
+
+def _store_layer_mask(layer_idx: int, topk_chunk_indices: torch.Tensor):
+    """Store the topk chunk indices for a layer."""
+    global _LAYER_MASK_CACHE
+    _LAYER_MASK_CACHE[layer_idx] = topk_chunk_indices.detach()
+
+
+def _get_prev_layer_mask(layer_idx: int) -> torch.Tensor:
+    """Get the topk chunk indices from the previous layer."""
+    global _LAYER_MASK_CACHE
+    return _LAYER_MASK_CACHE.get(layer_idx - 1, None)
+
+
+def _compute_prediction_rate_per_head(
+    prev_chunk_indices: torch.Tensor,  # (B, H, Q, K_prev)
+    curr_chunk_indices: torch.Tensor,  # (B, H, Q, K_curr)
+) -> torch.Tensor:
+    """Compute prediction rate per head.
+
+    Returns: (H,) tensor with prediction rate for each head
+    """
+    if prev_chunk_indices is None or prev_chunk_indices.numel() == 0:
+        return torch.zeros(curr_chunk_indices.size(1), device=curr_chunk_indices.device)
+
+    if curr_chunk_indices.numel() == 0:
+        return torch.zeros(curr_chunk_indices.size(1), device=curr_chunk_indices.device)
+
+    # For each position, count overlap
+    prev_set = prev_chunk_indices.unsqueeze(-1)  # (B, H, Q, K_prev, 1)
+    curr_set = curr_chunk_indices.unsqueeze(-2)  # (B, H, Q, 1, K_curr)
+
+    matches = (prev_set == curr_set).any(dim=-1)  # (B, H, Q, K_prev)
+    overlap_count = matches.sum(dim=-1).float()  # (B, H, Q)
+    prev_count = float(prev_chunk_indices.size(-1))
+
+    if prev_count > 0:
+        rate_per_head = (overlap_count / prev_count).mean(dim=(0, 2))  # Average over B and Q, keep H
+    else:
+        rate_per_head = torch.zeros(curr_chunk_indices.size(1), device=curr_chunk_indices.device)
+
+    return rate_per_head  # (H,)
+
+
+# Per-module state for token-level tracking
+def _ensure_tracking_state(module) -> Dict:
+    """Ensure tracking state exists on module."""
+    if not hasattr(module, "_tracking_state"):
+        module._tracking_state = {
+            "prev_topk_chunk_indices": None,  # For token-level tracking
+            "task_index": 0,
+        }
+    return module._tracking_state
+
+
+def _reset_tracking_state(module):
+    """Reset tracking state."""
+    if hasattr(module, "_tracking_state"):
+        module._tracking_state["prev_topk_chunk_indices"] = None
+
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
@@ -52,7 +131,7 @@ if is_torch_flex_attn_available():
 
 logger = logging.get_logger(__name__)
 
-def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size):
+def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size, return_indices=False):
     # attn_weights (BS, head, query, keys)
 
     # Pad attn_weights to be divisible by chunk_size using F.pad (memory efficient)
@@ -87,7 +166,6 @@ def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size):
         device=attn_weights.device, dtype=torch.bool
     )
     mask_chunks.scatter_(-1, topk, True)
-    del topk  # Free memory
 
     # Expand chunk mask to token level
     mask_bottom = mask_chunks.unsqueeze(-1).expand(
@@ -97,7 +175,125 @@ def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size):
 
     # Remove the padding
     mask_bottom = mask_bottom[:, :, :, :seq_length]
+
+    if return_indices:
+        return mask_bottom, topk
     return mask_bottom
+
+
+def _build_static_chunk_mask(
+    num_chunks: int,
+    static_budget_chunks: int,
+    bsz: int,
+    num_heads: int,
+    q_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build static chunk mask with 1:3 ratio for prefix:suffix.
+    Returns: (B, H, Q, num_chunks) bool mask
+    """
+    if static_budget_chunks <= 0 or num_chunks <= 0:
+        return torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+
+    # Allocate 1:3 ratio (prefix:suffix)
+    prefix_chunks = static_budget_chunks // 4
+    suffix_chunks = static_budget_chunks - prefix_chunks
+
+    # Clamp to valid range
+    prefix_chunks = min(prefix_chunks, num_chunks)
+    suffix_chunks = min(suffix_chunks, max(0, num_chunks - prefix_chunks))
+
+    # Create mask
+    mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+    if prefix_chunks > 0:
+        mask[:, :, :, :prefix_chunks] = True
+    if suffix_chunks > 0:
+        mask[:, :, :, -suffix_chunks:] = True
+
+    return mask
+
+
+def _build_hybrid_selection_mask(
+    chunk_scores: torch.Tensor,  # (B, H, Q, num_chunks) or similar
+    kv_seq_len: int,
+    chunk_size: int,
+    token_budget: int,
+    static_ratio: float,
+    return_indices: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Build hybrid selection with static + chunk topk.
+
+    Args:
+        chunk_scores: Chunk-level attention scores (B, H, Q, num_chunks)
+        kv_seq_len: Total KV sequence length
+        chunk_size: Size of each chunk
+        token_budget: Total token budget
+        static_ratio: Ratio for static prefix/suffix (0.0 to 1.0)
+        return_indices: If True, also return topk_chunk_indices
+
+    Returns:
+        combined_mask: (B, H, Q, kv_seq_len) - Combined selection mask
+        topk_chunk_indices: (B, H, Q, k) - Topk chunk indices (only if return_indices=True)
+    """
+    bsz, num_heads, q_len, num_chunks_scores = chunk_scores.shape
+    device = chunk_scores.device
+    chunk_sz = max(1, int(chunk_size))
+    num_chunks = (kv_seq_len + chunk_sz - 1) // chunk_sz
+
+    # Validate chunk_scores shape matches computed num_chunks
+    if num_chunks_scores < num_chunks:
+        # Pad chunk_scores with -inf for missing chunks
+        pad_chunks = num_chunks - num_chunks_scores
+        chunk_scores = torch.nn.functional.pad(
+            chunk_scores, (0, pad_chunks), value=float('-inf')
+        )
+
+    # Split budget
+    static_budget_tokens = int(token_budget * static_ratio)
+    chunk_topk_budget_tokens = token_budget - static_budget_tokens
+
+    static_budget_chunks = (static_budget_tokens + chunk_sz - 1) // chunk_sz
+    chunk_topk_budget_chunks = chunk_topk_budget_tokens // chunk_sz
+
+    # Build static mask at chunk level
+    static_chunk_mask = _build_static_chunk_mask(
+        num_chunks, static_budget_chunks, bsz, num_heads, q_len, device
+    )  # (B, H, Q, num_chunks)
+
+    # Zero out static chunks in scores for topk selection
+    chunk_scores_masked = chunk_scores.clone()
+    chunk_scores_masked = chunk_scores_masked[..., :num_chunks]
+    chunk_scores_masked[static_chunk_mask] = float('-inf')
+
+    # Select top-k from remaining chunks
+    available_chunks = max(0, num_chunks - static_budget_chunks)
+    k = min(chunk_topk_budget_chunks, available_chunks)
+
+    if k > 0 and available_chunks > 0:
+        _, topk_chunk_indices = torch.topk(chunk_scores_masked, k=k, dim=-1)  # (B, H, Q, k)
+
+        # Build topk mask at chunk level
+        topk_chunk_mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+        topk_chunk_mask.scatter_(-1, topk_chunk_indices, True)
+    else:
+        topk_chunk_indices = torch.zeros((bsz, num_heads, q_len, 0), dtype=torch.long, device=device)
+        topk_chunk_mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+
+    # Combine static and topk masks at chunk level
+    combined_chunk_mask = static_chunk_mask | topk_chunk_mask
+
+    # Expand chunk mask to token level
+    padded_len = num_chunks * chunk_sz
+    combined_mask = combined_chunk_mask.unsqueeze(-1).expand(
+        bsz, num_heads, q_len, num_chunks, chunk_sz
+    ).reshape(bsz, num_heads, q_len, padded_len)
+
+    # Trim to actual sequence length
+    combined_mask = combined_mask[..., :kv_seq_len]
+
+    if return_indices:
+        return combined_mask, topk_chunk_indices
+    return combined_mask
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -209,6 +405,18 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+def set_task_index_for_model(model, task_index: int) -> None:
+    """Set task_index in all attention module states for immediate write mode."""
+    # Reset layer mask cache for new task
+    _reset_layer_mask_cache()
+
+    for module in model.modules():
+        if isinstance(module, Qwen3Attention):
+            state = _ensure_tracking_state(module)
+            state["task_index"] = task_index
+            state["prev_topk_chunk_indices"] = None  # Reset for new task
+
+
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -243,6 +451,7 @@ class Qwen3Attention(nn.Module):
         self.chunk_size = config.chunk_size
         self.token_budget = config.token_budget
         self.start_layer = config.start_layer
+        self.static_ratio = getattr(config, "static_ratio", 0.0)
         if not (
             self.config.use_sliding_window
             and getattr(self.config, "sliding_window", None) is not None
@@ -410,17 +619,114 @@ class Qwen3Attention(nn.Module):
                 quantized_weight.clamp_(min=torch.finfo(quantized_weight.dtype).min)
 
             token_budget = min(kv_seq_len, self.token_budget)
+            static_ratio = float(self.static_ratio)
+
+            # Check if tracking is enabled
+            track_prediction = getattr(self, "track_prediction", False)
+            topk_chunk_indices = None
 
             # Generate mask at KV-head level
             if token_budget > 0:
-                mask_bottom_kv = local_heavy_hitter_mask(
-                    quantized_weight, token_budget, self.chunk_size
-                )  # (bsz, num_kv_heads, q_len, kv_seq_len)
+                if static_ratio > 0:
+                    # Hybrid mask: static prefix/suffix + dynamic top-k
+                    # Convert quantized_weight to chunk scores
+                    seq_length = quantized_weight.shape[-1]
+                    padding_length = self.chunk_size - ((seq_length - 1) % self.chunk_size + 1)
+                    if padding_length > 0 and padding_length < self.chunk_size:
+                        qw_padded = torch.nn.functional.pad(
+                            quantized_weight, (0, padding_length), value=torch.finfo(quantized_weight.dtype).min
+                        )
+                    else:
+                        qw_padded = quantized_weight
+                    padded_len = qw_padded.shape[-1]
+                    num_chunks = padded_len // self.chunk_size
+
+                    # Compute chunk scores (max over each chunk)
+                    chunk_scores = qw_padded.reshape(
+                        bsz, self.num_key_value_heads, q_len, num_chunks, self.chunk_size
+                    ).amax(dim=-1)  # (bsz, num_kv_heads, q_len, num_chunks)
+                    del qw_padded
+
+                    # Build hybrid selection mask
+                    if track_prediction:
+                        mask_bottom_kv, topk_chunk_indices = _build_hybrid_selection_mask(
+                            chunk_scores, kv_seq_len, self.chunk_size, token_budget, static_ratio,
+                            return_indices=True
+                        )
+                    else:
+                        mask_bottom_kv = _build_hybrid_selection_mask(
+                            chunk_scores, kv_seq_len, self.chunk_size, token_budget, static_ratio
+                        )  # (bsz, num_kv_heads, q_len, kv_seq_len)
+                    del chunk_scores
+                else:
+                    # Original: dynamic top-k only
+                    if track_prediction:
+                        mask_bottom_kv, topk_chunk_indices = local_heavy_hitter_mask(
+                            quantized_weight, token_budget, self.chunk_size, return_indices=True
+                        )
+                    else:
+                        mask_bottom_kv = local_heavy_hitter_mask(
+                            quantized_weight, token_budget, self.chunk_size
+                        )  # (bsz, num_kv_heads, q_len, kv_seq_len)
             else:
                 mask_bottom_kv = torch.zeros_like(quantized_weight, dtype=torch.bool)
             del quantized_weight  # Free memory
 
         mask_bottom_kv = torch.tril(mask_bottom_kv, diagonal=position_ids[0][0].item())
+
+        # Prediction rate tracking
+        if track_prediction and topk_chunk_indices is not None and topk_chunk_indices.numel() > 0:
+            with torch.no_grad():
+                state = _ensure_tracking_state(self)
+
+                # Get previous topk indices for token-level similarity
+                prev_topk_indices = state.get("prev_topk_chunk_indices")
+
+                # Get previous layer's mask for layer-level similarity
+                prev_layer_mask = _get_prev_layer_mask(self.layer_idx)
+
+                # Compute token-level prediction rate (consecutive tokens)
+                token_pred_per_head = _compute_prediction_rate_per_head(prev_topk_indices, topk_chunk_indices)
+
+                # Compute layer-level prediction rate (consecutive layers)
+                layer_pred_per_head = _compute_prediction_rate_per_head(prev_layer_mask, topk_chunk_indices)
+
+                # Build per_head_rates list (at KV-head level)
+                per_head_rates = []
+                for head_idx in range(self.num_key_value_heads):
+                    head_dict = {
+                        "pred_token": token_pred_per_head[head_idx].item(),
+                        "pred_layer": layer_pred_per_head[head_idx].item(),
+                    }
+                    per_head_rates.append(head_dict)
+
+                # Write to global tracker
+                if reuse_util is not None:
+                    # Check write mode from global prediction state
+                    pred_state = getattr(reuse_util, "_PRED", None)
+                    write_mode = pred_state.write_mode if pred_state is not None else "accumulate"
+
+                    if write_mode == "immediate":
+                        task_index = state.get("task_index", 0)
+                        if hasattr(reuse_util, "pred_write_immediate"):
+                            reuse_util.pred_write_immediate(
+                                task_index=task_index,
+                                layer_idx=self.layer_idx,
+                                per_head_rates=per_head_rates,
+                            )
+                    else:
+                        # Accumulate mode (default)
+                        if hasattr(reuse_util, "pred_accumulate_layer"):
+                            reuse_util.pred_accumulate_layer(
+                                layer_idx=self.layer_idx,
+                                per_head_rates=per_head_rates,
+                            )
+
+                # Store current topk indices for next token step
+                state["prev_topk_chunk_indices"] = topk_chunk_indices.detach()
+
+                # Store current mask for next layer
+                _store_layer_mask(self.layer_idx, topk_chunk_indices)
 
         # Expand mask to all heads (same mask for queries sharing the same KV)
         mask_bottom = mask_bottom_kv.unsqueeze(2).expand(

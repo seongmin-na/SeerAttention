@@ -1,16 +1,18 @@
-model_dir="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-output_dir="./result_oracle_sparse"
+# model_dir="Qwen/Qwen3-4B-Instruct-2507"
+model_dir="Qwen/Qwen3-4B-Thinking-2507"
+output_dir="./result_oracle_sparse_aime"
 attention_implementation="oracle_sparse"
 max_tokens=32768
-num_gpus=8
-limit=-1
+num_gpus=2
+limit=100
 
 # tasks="aime24,aime25,math,gpqa"
-tasks="aime24"
+# tasks="math"
+tasks="aime25"
 
 block_size="16,32,64,128"
 sparsity_method="token_budget"
-token_budget="1024,2048,4096,8192"
+token_budget="256,512,1024,2048,4096"
 
 python parallel_run_hf.py \
       --model_dir "$model_dir" \

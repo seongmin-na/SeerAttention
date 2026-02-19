@@ -775,14 +775,24 @@ class SeerDecodingQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             for key in list(kwargs.keys()):
                 if hasattr(config, key) and key != "torch_dtype":
                     setattr(config, key, kwargs.pop(key))
-            model = super().from_pretrained(base_model, config=config, *model_args, **kwargs)
 
+            import logging
+            old_disable = logging.root.manager.disable
+            logging.disable(logging.CRITICAL)
+            try:
+                model = super().from_pretrained(base_model, config=config, *model_args, **kwargs)
+            finally:
+                logging.disable(old_disable)
+                
             if os.path.exists(pretrained_model_name_or_path):
-                gate_weights = torch.load(os.path.join(pretrained_model_name_or_path, "attn_gate_weights.pth"))
+                gate_weights = torch.load(os.path.join(pretrained_model_name_or_path, "attn_gate_weights.pth") ,
+                 map_location="cpu", 
+                 weights_only=True,)
             else:
                 try: 
                     gate_weights = torch.load(
-                        hf_hub_download(repo_id=pretrained_model_name_or_path, filename="attn_gate_weights.pth")
+                        hf_hub_download(repo_id=pretrained_model_name_or_path, filename="attn_gate_weights.pth"), 
+                                        map_location="cpu", weights_only=True,
                     )
                 except:
                     raise ValueError("Could not load the attention gate weights.")

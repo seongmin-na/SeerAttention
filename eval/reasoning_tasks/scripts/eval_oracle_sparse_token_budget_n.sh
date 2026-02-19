@@ -1,25 +1,27 @@
+# model_dir="Qwen/Qwen3-4B-Instruct-2507"
 model_dir="Qwen/Qwen3-4B-Thinking-2507"
-output_dir="./result_oracle_sparse"
+output_dir="./result_oracle_sparse_math"
 attention_implementation="oracle_sparse"
 max_tokens=32768
 num_gpus=4
-limit=16
+limit=500
 
 # tasks="aime24,aime25,math,gpqa"
-tasks="aime24"
+tasks="math"
+# tasks="aime25"
 
 block_size="16,32,64,128"
-sparsity_method="threshold"
-threshold="1e-4,5e-4,1e-3"
+sparsity_method="token_budget"
+token_budget="128,256,512,1024,2048,4096"
 
-python parallel_run_hf.py \
+python split_run_hf.py \
       --model_dir "$model_dir" \
       --tasks "$tasks" \
       --output_dir "$output_dir" \
       --attention_implementation "$attention_implementation" \
       --block_size "$block_size" \
       --sparsity_method "$sparsity_method" \
-      --threshold "$threshold" \
+      --token_budget "$token_budget" \
       --profile_sparsity \
       --num_gpus "$num_gpus" \
       --limit "$limit" \

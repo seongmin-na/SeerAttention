@@ -38,6 +38,116 @@ if is_torch_flex_attn_available():
 
 logger = logging.get_logger(__name__)
 
+
+def _build_static_chunk_mask(
+    num_chunks: int,
+    static_budget_chunks: int,
+    bsz: int,
+    num_heads: int,
+    q_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build static chunk mask with 1:3 ratio for prefix:suffix.
+    Returns: (B, H, Q, num_chunks) bool mask
+    """
+    if static_budget_chunks <= 0 or num_chunks <= 0:
+        return torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+
+    # Allocate 1:3 ratio (prefix:suffix)
+    prefix_chunks = static_budget_chunks // 4
+    suffix_chunks = static_budget_chunks - prefix_chunks
+
+    # Clamp to valid range
+    prefix_chunks = min(prefix_chunks, num_chunks)
+    suffix_chunks = min(suffix_chunks, max(0, num_chunks - prefix_chunks))
+
+    # Create mask
+    mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+    if prefix_chunks > 0:
+        mask[:, :, :, :prefix_chunks] = True
+    if suffix_chunks > 0:
+        mask[:, :, :, -suffix_chunks:] = True
+
+    return mask
+
+
+def _build_hybrid_selection_mask(
+    chunk_scores: torch.Tensor,  # (B, H, Q, num_chunks) or similar
+    kv_seq_len: int,
+    chunk_size: int,
+    token_budget: int,
+    static_ratio: float,
+) -> torch.Tensor:
+    """Build hybrid selection with static + chunk topk.
+
+    Args:
+        chunk_scores: Chunk-level attention scores (B, H, Q, num_chunks)
+        kv_seq_len: Total KV sequence length
+        chunk_size: Size of each chunk
+        token_budget: Total token budget
+        static_ratio: Ratio for static prefix/suffix (0.0 to 1.0)
+
+    Returns:
+        combined_mask: (B, H, Q, kv_seq_len) - Combined selection mask
+    """
+    bsz, num_heads, q_len, num_chunks_scores = chunk_scores.shape
+    device = chunk_scores.device
+    chunk_sz = max(1, int(chunk_size))
+    num_chunks = (kv_seq_len + chunk_sz - 1) // chunk_sz
+
+    # Validate chunk_scores shape matches computed num_chunks
+    if num_chunks_scores < num_chunks:
+        # Pad chunk_scores with -inf for missing chunks
+        pad_chunks = num_chunks - num_chunks_scores
+        chunk_scores = torch.nn.functional.pad(
+            chunk_scores, (0, pad_chunks), value=float('-inf')
+        )
+
+    # Split budget
+    static_budget_tokens = int(token_budget * static_ratio)
+    chunk_topk_budget_tokens = token_budget - static_budget_tokens
+
+    static_budget_chunks = (static_budget_tokens + chunk_sz - 1) // chunk_sz
+    chunk_topk_budget_chunks = chunk_topk_budget_tokens // chunk_sz
+
+    # Build static mask at chunk level
+    static_chunk_mask = _build_static_chunk_mask(
+        num_chunks, static_budget_chunks, bsz, num_heads, q_len, device
+    )  # (B, H, Q, num_chunks)
+
+    # Zero out static chunks in scores for topk selection
+    chunk_scores_masked = chunk_scores.clone()
+    chunk_scores_masked = chunk_scores_masked[..., :num_chunks]
+    chunk_scores_masked[static_chunk_mask] = float('-inf')
+
+    # Select top-k from remaining chunks
+    available_chunks = max(0, num_chunks - static_budget_chunks)
+    k = min(chunk_topk_budget_chunks, available_chunks)
+
+    if k > 0 and available_chunks > 0:
+        _, topk_chunk_indices = torch.topk(chunk_scores_masked, k=k, dim=-1)  # (B, H, Q, k)
+
+        # Build topk mask at chunk level
+        topk_chunk_mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+        topk_chunk_mask.scatter_(-1, topk_chunk_indices, True)
+    else:
+        topk_chunk_mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
+
+    # Combine static and topk masks at chunk level
+    combined_chunk_mask = static_chunk_mask | topk_chunk_mask
+
+    # Expand chunk mask to token level
+    padded_len = num_chunks * chunk_sz
+    combined_mask = combined_chunk_mask.unsqueeze(-1).expand(
+        bsz, num_heads, q_len, num_chunks, chunk_sz
+    ).reshape(bsz, num_heads, q_len, padded_len)
+
+    # Trim to actual sequence length
+    combined_mask = combined_mask[..., :kv_seq_len]
+
+    return combined_mask
+
+
 def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size):
     # attn_weights (BS, head, query, keys)
 
@@ -198,6 +308,7 @@ class Qwen2Attention(nn.Module):
         self.chunk_size = config.chunk_size
         self.token_budget = config.token_budget
         self.start_layer = config.start_layer
+        self.static_ratio = getattr(config, "static_ratio", 0.0)
 
     def flash_forward(
         self,
@@ -365,14 +476,39 @@ class Qwen2Attention(nn.Module):
             )
 
         token_budget = min(kv_seq_len, self.token_budget)
-
+        static_ratio = float(self.static_ratio)
 
         attn_weights_for_selection = quantized_weight
 
         if token_budget > 0:
-            mask_bottom = local_heavy_hitter_mask(
-                attn_weights_for_selection, token_budget, self.chunk_size
-            )  # Default: No padding applied to input
+            if static_ratio > 0:
+                # Hybrid mask: static prefix/suffix + dynamic top-k
+                # Convert quantized_weight to chunk scores
+                seq_length = quantized_weight.shape[-1]
+                padding_length = self.chunk_size - ((seq_length - 1) % self.chunk_size + 1)
+                if padding_length > 0 and padding_length < self.chunk_size:
+                    qw_padded = torch.nn.functional.pad(
+                        quantized_weight, (0, padding_length), value=torch.finfo(quantized_weight.dtype).min
+                    )
+                else:
+                    qw_padded = quantized_weight
+                padded_len = qw_padded.shape[-1]
+                num_chunks = padded_len // self.chunk_size
+
+                # Compute chunk scores (max over each chunk)
+                chunk_scores = qw_padded.reshape(
+                    bsz, self.num_heads, q_len, num_chunks, self.chunk_size
+                ).amax(dim=-1)  # (bsz, num_heads, q_len, num_chunks)
+
+                # Build hybrid selection mask
+                mask_bottom = _build_hybrid_selection_mask(
+                    chunk_scores, kv_seq_len, self.chunk_size, token_budget, static_ratio
+                )  # (bsz, num_heads, q_len, kv_seq_len)
+            else:
+                # Original: dynamic top-k only
+                mask_bottom = local_heavy_hitter_mask(
+                    attn_weights_for_selection, token_budget, self.chunk_size
+                )  # Default: No padding applied to input
         else:
             mask_bottom = torch.zeros_like(attn_weights_for_selection, dtype=torch.bool)
 

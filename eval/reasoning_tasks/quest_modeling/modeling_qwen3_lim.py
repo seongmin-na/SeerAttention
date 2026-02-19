@@ -41,99 +41,8 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, can_return_tuple, is_torch_flex_attn_available, logging
-from .configuration_qwen3_quest import QuestQwen3Config
+from .configuration_qwen3_lim import LimQwen3Config
 import math
-from typing import Dict, Sequence
-
-# Optional: prediction tracking (only if available)
-try:
-    import sys
-    import os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../'))
-    import reuse_utils as reuse_util
-except Exception:
-    reuse_util = None
-
-# Global state for cross-layer mask sharing (for layer similarity tracking)
-_LAYER_MASK_CACHE: Dict[int, torch.Tensor] = {}  # layer_idx -> topk_chunk_indices
-
-
-def _reset_layer_mask_cache():
-    """Reset the layer mask cache (call at beginning of each generation step)."""
-    global _LAYER_MASK_CACHE
-    _LAYER_MASK_CACHE.clear()
-
-
-def _store_layer_mask(layer_idx: int, topk_chunk_indices: torch.Tensor):
-    """Store the topk chunk indices for a layer."""
-    global _LAYER_MASK_CACHE
-    _LAYER_MASK_CACHE[layer_idx] = topk_chunk_indices.detach()
-
-
-def _get_prev_layer_mask(layer_idx: int) -> torch.Tensor:
-    """Get the topk chunk indices from the previous layer."""
-    global _LAYER_MASK_CACHE
-    return _LAYER_MASK_CACHE.get(layer_idx - 1, None)
-
-
-def _compute_prediction_rate_per_head(
-    prev_chunk_indices: torch.Tensor,  # (B, H, Q, K_prev)
-    curr_chunk_indices: torch.Tensor,  # (B, H, Q, K_curr)
-) -> torch.Tensor:
-    """Compute prediction rate per head.
-
-    Returns: (H,) tensor with prediction rate for each head
-    """
-    if prev_chunk_indices is None or prev_chunk_indices.numel() == 0:
-        return torch.zeros(curr_chunk_indices.size(1), device=curr_chunk_indices.device)
-
-    if curr_chunk_indices.numel() == 0:
-        return torch.zeros(curr_chunk_indices.size(1), device=curr_chunk_indices.device)
-
-    # For each position, count overlap
-    prev_set = prev_chunk_indices.unsqueeze(-1)  # (B, H, Q, K_prev, 1)
-    curr_set = curr_chunk_indices.unsqueeze(-2)  # (B, H, Q, 1, K_curr)
-
-    matches = (prev_set == curr_set).any(dim=-1)  # (B, H, Q, K_prev)
-    overlap_count = matches.sum(dim=-1).float()  # (B, H, Q)
-    prev_count = float(prev_chunk_indices.size(-1))
-
-    if prev_count > 0:
-        rate_per_head = (overlap_count / prev_count).mean(dim=(0, 2))  # Average over B and Q, keep H
-    else:
-        rate_per_head = torch.zeros(curr_chunk_indices.size(1), device=curr_chunk_indices.device)
-
-    return rate_per_head  # (H,)
-
-
-# Per-module state for token-level tracking
-def _ensure_tracking_state(module) -> Dict:
-    """Ensure tracking state exists on module."""
-    if not hasattr(module, "_tracking_state"):
-        module._tracking_state = {
-            "prev_topk_chunk_indices": None,  # For token-level tracking
-            "task_index": 0,
-        }
-    return module._tracking_state
-
-
-def _reset_tracking_state(module):
-    """Reset tracking state."""
-    if hasattr(module, "_tracking_state"):
-        module._tracking_state["prev_topk_chunk_indices"] = None
-
-
-def set_task_index_for_model(model, task_index: int) -> None:
-    """Set task_index in all attention module states for immediate write mode."""
-    # Reset layer mask cache for new task
-    _reset_layer_mask_cache()
-
-    for module in model.modules():
-        if isinstance(module, Qwen3Attention):
-            state = _ensure_tracking_state(module)
-            state["task_index"] = task_index
-            state["prev_topk_chunk_indices"] = None  # Reset for new task
-
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
@@ -143,7 +52,7 @@ if is_torch_flex_attn_available():
 
 logger = logging.get_logger(__name__)
 
-def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size, return_indices=False):
+def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size):
     # attn_weights (BS, head, query, keys)
 
     # Pad attn_weights to be divisible by chunk_size using F.pad (memory efficient)
@@ -178,6 +87,7 @@ def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size, return_indic
         device=attn_weights.device, dtype=torch.bool
     )
     mask_chunks.scatter_(-1, topk, True)
+    del topk  # Free memory
 
     # Expand chunk mask to token level
     mask_bottom = mask_chunks.unsqueeze(-1).expand(
@@ -187,9 +97,6 @@ def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size, return_indic
 
     # Remove the padding
     mask_bottom = mask_bottom[:, :, :, :seq_length]
-
-    if return_indices:
-        return mask_bottom, topk
     return mask_bottom
 
 
@@ -231,8 +138,7 @@ def _build_hybrid_selection_mask(
     chunk_size: int,
     token_budget: int,
     static_ratio: float,
-    return_indices: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> torch.Tensor:
     """Build hybrid selection with static + chunk topk.
 
     Args:
@@ -241,11 +147,9 @@ def _build_hybrid_selection_mask(
         chunk_size: Size of each chunk
         token_budget: Total token budget
         static_ratio: Ratio for static prefix/suffix (0.0 to 1.0)
-        return_indices: If True, also return topk_chunk_indices
 
     Returns:
         combined_mask: (B, H, Q, kv_seq_len) - Combined selection mask
-        topk_chunk_indices: (B, H, Q, k) - Topk chunk indices (only if return_indices=True)
     """
     bsz, num_heads, q_len, num_chunks_scores = chunk_scores.shape
     device = chunk_scores.device
@@ -288,7 +192,6 @@ def _build_hybrid_selection_mask(
         topk_chunk_mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
         topk_chunk_mask.scatter_(-1, topk_chunk_indices, True)
     else:
-        topk_chunk_indices = torch.zeros((bsz, num_heads, q_len, 0), dtype=torch.long, device=device)
         topk_chunk_mask = torch.zeros((bsz, num_heads, q_len, num_chunks), dtype=torch.bool, device=device)
 
     # Combine static and topk masks at chunk level
@@ -303,8 +206,6 @@ def _build_hybrid_selection_mask(
     # Trim to actual sequence length
     combined_mask = combined_mask[..., :kv_seq_len]
 
-    if return_indices:
-        return combined_mask, topk_chunk_indices
     return combined_mask
 
 
@@ -420,7 +321,11 @@ def eager_attention_forward(
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: QuestQwen3Config, layer_idx: int):
+    # Class-level storage for shared pos_mask across layers
+    _shared_pos_mask = None
+    _shared_pos_index = None
+
+    def __init__(self, config: LimQwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -492,8 +397,6 @@ class Qwen3Attention(nn.Module):
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-    
-          
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -514,236 +417,234 @@ class Qwen3Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        output_attentions: bool = False,
+        top_k: int = None,
+        sparse_layer_start: int = None,
+        correction_layer: int = 9,
+        attention_sink: int = 4,
+        tidal_ratio: float = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        bsz, q_len, _ = hidden_states.size()
+    ):
+        """
+        LessIsMore forward pass for Qwen3Attention
 
-        if q_len > 1 or self.layer_idx < self.start_layer:
+        prefilling: as full-weight attention
+        generation:
+        - non-sparse layers: full-weight attention #1
+        - sparse_layer_start: full-weight attention + top_k selection #2          topk: (1, 32, 1, topk) => fold (1, 32, topk)
+        - sattn_layer_start -> correction layer - 1: use the same top-k #3        Q: (1, 32, 1, 128) K: (1, 32, topk, 128)
+        - correction layer: full-weight attention + new top_k selection
+        - after correction layer: use the same top-k
+        """
+
+        # Use config values if not provided
+        if sparse_layer_start is None:
+            sparse_layer_start = self.start_layer
+        if tidal_ratio is None:
+            tidal_ratio = self.static_ratio
+
+        # If output_attentions is True, fall back to original implementation
+        if output_attentions:
             return self.flash_forward(
-                hidden_states,
-                position_embeddings,
-                attention_mask,
-                past_key_value,
-                cache_position,
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                cache_position=cache_position,
                 **kwargs,
             )
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        bsz, q_len = input_shape
+
+        # Project and normalize query, key, value
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(
+            1, 2
+        )
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(
+            1, 2
+        )
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        # Apply rotary position embeddings
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # Update cache
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        kv_seq_len = key_states.shape[2]
-        # print(f"kv_seq_len: {kv_seq_len}")
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # Compute sign in-place friendly way
-        sign = query_states.sign()
-        sign[sign == 0] = 1  # Handle zeros
-        max_key = key_states * sign
-        positive_query = query_states * sign
-        del sign  # Free memory
-
-        # Pad max_key to be divisible by chunk_size using F.pad (more memory efficient than torch.cat)
-        seq_length = max_key.shape[-2]
-        padding_length = self.chunk_size - ((seq_length - 1) % self.chunk_size + 1)
-        if padding_length > 0 and padding_length < self.chunk_size:
-            max_key = torch.nn.functional.pad(
-                max_key, (0, 0, 0, padding_length), value=torch.finfo(max_key.dtype).min
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        # Chunk max_key into chunk_size tokens and get max
-        chunk_max_key = max_key.reshape(
-            max_key.shape[0],
-            max_key.shape[1],
-            max_key.shape[2] // self.chunk_size,
-            self.chunk_size,
-            max_key.shape[3],
-        ).amax(dim=-2)
-        del max_key  # Free memory
-
-        # Duplicate chunk_max_key chunk_size times (use repeat_interleave for memory efficiency)
-        chunk_max_key = chunk_max_key.repeat_interleave(self.chunk_size, dim=-2)[:, :, :seq_length, :]
-
-        # Keep in bfloat16 - sufficient precision for mask generation (top-k selection)
-        with torch.no_grad():
-            quantized_weight = torch.matmul(
-                positive_query,
-                chunk_max_key.transpose(2, 3),
-            )
-            del positive_query, chunk_max_key  # Free memory
-
-            # Recompute attn_weights (allows max_key memory to be freed first)
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                    f" {attn_weights.size()}"
-                )
-
-            if attention_mask is not None:
-                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                    raise ValueError(
-                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                    )
-                attn_weights.add_(attention_mask)
-                attn_weights.clamp_(min=torch.finfo(attn_weights.dtype).min)
-                
-                quantized_weight.add_(attention_mask)
-                quantized_weight.clamp_(min=torch.finfo(quantized_weight.dtype).min)
-                
-            token_budget = min(kv_seq_len, self.token_budget)
-            static_ratio = float(self.static_ratio)
-
-            # Check if tracking is enabled
-            track_prediction = getattr(self, "track_prediction", False)
-            topk_chunk_indices = None
-
-            if token_budget > 0:
-                if static_ratio > 0:
-                    # Hybrid mask: static prefix/suffix + dynamic top-k
-                    # Convert quantized_weight to chunk scores
-                    seq_length = quantized_weight.shape[-1]
-                    padding_length = self.chunk_size - ((seq_length - 1) % self.chunk_size + 1)
-                    if padding_length > 0 and padding_length < self.chunk_size:
-                        qw_padded = torch.nn.functional.pad(
-                            quantized_weight, (0, padding_length), value=torch.finfo(quantized_weight.dtype).min
-                        )
-                    else:
-                        qw_padded = quantized_weight
-                    padded_len = qw_padded.shape[-1]
-                    num_chunks = padded_len // self.chunk_size
-
-                    # Compute chunk scores (max over each chunk)
-                    chunk_scores = qw_padded.reshape(
-                        bsz, self.num_heads, q_len, num_chunks, self.chunk_size
-                    ).amax(dim=-1)  # (bsz, num_heads, q_len, num_chunks)
-                    del qw_padded
-
-                    # Build hybrid selection mask
-                    if track_prediction:
-                        mask_bottom, topk_chunk_indices = _build_hybrid_selection_mask(
-                            chunk_scores, kv_seq_len, self.chunk_size, token_budget, static_ratio,
-                            return_indices=True
-                        )
-                    else:
-                        mask_bottom = _build_hybrid_selection_mask(
-                            chunk_scores, kv_seq_len, self.chunk_size, token_budget, static_ratio
-                        )  # (bsz, num_heads, q_len, kv_seq_len)
-                    del chunk_scores
-                else:
-                    # Original: dynamic top-k only
-                    if track_prediction:
-                        mask_bottom, topk_chunk_indices = local_heavy_hitter_mask(
-                            quantized_weight, token_budget, self.chunk_size, return_indices=True
-                        )
-                    else:
-                        mask_bottom = local_heavy_hitter_mask(
-                            quantized_weight, token_budget, self.chunk_size
-                        )  # Default: No padding applied to input
-            else:
-                mask_bottom = torch.zeros_like(quantized_weight, dtype=torch.bool)
-            del quantized_weight  # Free memory
-
-        mask_bottom = torch.tril(mask_bottom, diagonal=position_ids[0][0].item())
-
-        # Prediction rate tracking
-        if track_prediction and topk_chunk_indices is not None and topk_chunk_indices.numel() > 0:
-            with torch.no_grad():
-                state = _ensure_tracking_state(self)
-
-                # Get previous topk indices for token-level similarity
-                prev_topk_indices = state.get("prev_topk_chunk_indices")
-
-                # Get previous layer's mask for layer-level similarity
-                prev_layer_mask = _get_prev_layer_mask(self.layer_idx)
-
-                # Compute token-level prediction rate (consecutive tokens)
-                token_pred_per_head = _compute_prediction_rate_per_head(prev_topk_indices, topk_chunk_indices)
-
-                # Compute layer-level prediction rate (consecutive layers)
-                layer_pred_per_head = _compute_prediction_rate_per_head(prev_layer_mask, topk_chunk_indices)
-
-                # Build per_head_rates list
-                per_head_rates = []
-                for head_idx in range(self.num_heads):
-                    head_dict = {
-                        "pred_token": token_pred_per_head[head_idx].item(),
-                        "pred_layer": layer_pred_per_head[head_idx].item(),
-                    }
-                    per_head_rates.append(head_dict)
-
-                # Write to global tracker
-                if reuse_util is not None:
-                    # Check write mode from global prediction state
-                    pred_state = getattr(reuse_util, "_PRED", None)
-                    write_mode = pred_state.write_mode if pred_state is not None else "accumulate"
-
-                    if write_mode == "immediate":
-                        task_index = state.get("task_index", 0)
-                        if hasattr(reuse_util, "pred_write_immediate"):
-                            reuse_util.pred_write_immediate(
-                                task_index=task_index,
-                                layer_idx=self.layer_idx,
-                                per_head_rates=per_head_rates,
-                            )
-                    else:
-                        # Accumulate mode (default)
-                        if hasattr(reuse_util, "pred_accumulate_layer"):
-                            reuse_util.pred_accumulate_layer(
-                                layer_idx=self.layer_idx,
-                                per_head_rates=per_head_rates,
-                            )
-
-                # Store current topk indices for next token step
-                state["prev_topk_chunk_indices"] = topk_chunk_indices.detach()
-
-                # Store current mask for next layer
-                _store_layer_mask(self.layer_idx, topk_chunk_indices)
-
-        attn_weights[~mask_bottom] = torch.finfo(attn_weights.dtype).min
-        del mask_bottom  # Free memory
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query_states.dtype
+        kv_seq_len = (
+            past_key_value.get_seq_length(self.layer_idx)
+            if past_key_value is not None
+            else q_len
         )
 
-        with torch.no_grad():
-            attn_output = torch.matmul(attn_weights, value_states)
+        # Check if we should use sparse attention
+        if self.layer_idx < sparse_layer_start or q_len == kv_seq_len:
+            # Non-sparse layers or prefilling - use original attention interface
+            attention_interface = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                if self.config._attn_implementation == "sdpa" and kwargs.get(
+                    "output_attentions", False
+                ):
+                    pass  # Stay with eager
+                else:
+                    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
+                    attention_interface = ALL_ATTENTION_FUNCTIONS[
+                        self.config._attn_implementation
+                    ]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
             )
 
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
+        else:
+            # Generation phase with sparse attention
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+            # Compute attention weights
+            attn_weights = (
+                torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+            )
+
+            if attention_mask is not None:
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            last_dim_size = attn_weights.size(-1)
+            token_budget = min(last_dim_size, top_k) if top_k is not None else min(last_dim_size, self.token_budget)
+
+            attn_weights_real = attn_weights.clone()
+
+            # Token selection logic
+            if (
+                self.layer_idx == sparse_layer_start or self.layer_idx == correction_layer
+            ) and token_budget >= last_dim_size:
+                # Store in class-level shared storage for cross-layer access
+                Qwen3Attention._shared_pos_mask = torch.ones_like(attn_weights)
+            elif (
+                self.layer_idx == sparse_layer_start
+                or self.layer_idx == correction_layer
+            ):
+                middle_budget = int(token_budget * tidal_ratio)
+                most_recent_amount = token_budget - middle_budget
+                if most_recent_amount < attention_sink:
+                    attention_sink = 0
+                else:
+                    most_recent_amount -= attention_sink
+                assert middle_budget + attention_sink + most_recent_amount == token_budget
+
+                sink_indices = torch.arange(attention_sink, device=attn_weights.device)
+                sink_indices = sink_indices.expand(
+                    attn_weights.shape[:-1] + (attention_sink,)
+                )
+
+                recent_start = last_dim_size - most_recent_amount
+                middle_scores = attn_weights[..., attention_sink:recent_start]
+                _, middle_indices = torch.topk(middle_scores, k=middle_budget, dim=-1)
+                middle_indices = middle_indices + attention_sink
+
+                ## Union capped by token_budget ###
+                union_tensor = middle_indices.transpose(1, 3).contiguous().view(bsz, -1)
+                union_list = list(dict.fromkeys(union_tensor[0].tolist()))
+                if len(union_list) > middle_budget:
+                    union_list = union_list[:middle_budget]
+                # (k,) -> (1, 32, 1, k) and replace top_k_indices
+                middle_indices = torch.tensor(
+                    union_list, dtype=middle_indices.dtype, device=middle_indices.device
+                )
+                middle_indices = middle_indices.unsqueeze(0).unsqueeze(1).unsqueeze(2)
+                middle_indices = middle_indices.expand(bsz, key_states.shape[1], q_len, -1)
+                ## Union capped by token_budget ###
+
+                recent_indices = torch.arange(
+                    recent_start, last_dim_size, device=attn_weights.device
+                )
+                recent_indices = recent_indices.expand(
+                    attn_weights.shape[:-1] + (most_recent_amount,)
+                )
+
+                # combine indices
+                top_k_indices = torch.cat(
+                    [sink_indices, middle_indices, recent_indices], dim=-1
+                )
+                top_k_mask = torch.zeros_like(attn_weights).scatter_(-1, top_k_indices, 1.0)
+                # Store in class-level shared storage for cross-layer access
+                Qwen3Attention._shared_pos_mask = top_k_mask
+                Qwen3Attention._shared_pos_index = top_k_indices
+
+            else:
+                # Apply stored top_k mask at sparse layers
+                if Qwen3Attention._shared_pos_mask is None:
+                    raise ValueError("pos_mask should be set up in sparse attention layers")
+                min_value = torch.finfo(attn_weights.dtype).min
+                attn_weights = attn_weights.masked_fill(
+                    Qwen3Attention._shared_pos_mask.to(attn_weights.device) == 0, min_value
+                )
+
+            # Apply softmax and compute output
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(query_states.dtype)
+
+            attn_weights = nn.functional.dropout(
+                attn_weights,
+                p=0.0 if not self.training else self.attention_dropout,
+                training=self.training,
+            )
+
+            attn_output = torch.matmul(attn_weights, value_states)
+
+            if attn_output.size() != (
+                bsz,
+                self.num_key_value_groups * self.num_key_value_groups,
+                q_len,
+                self.head_dim,
+            ):
+                # Handle GQA case - fix the expected size calculation
+                expected_heads = key_states.shape[
+                    1
+                ]  # This accounts for repeat_kv expansion
+                if attn_output.size() != (bsz, expected_heads, q_len, self.head_dim):
+                    raise ValueError(
+                        f"`attn_output` should be of size {(bsz, expected_heads, q_len, self.head_dim)}, but is"
+                        f" {attn_output.size()}"
+                    )
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(*input_shape, -1)
+            attn_output = self.o_proj(attn_output)
+
+            if not output_attentions:
+                attn_weights = None
+
+            return attn_output, attn_weights
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, config: QuestQwen3Config, layer_idx: int):
+    def __init__(self, config: LimQwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
@@ -776,13 +677,11 @@ class Qwen3DecoderLayer(nn.Module):
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            cache_position=cache_position,
+            output_attentions=output_attentions,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -801,7 +700,7 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3PreTrainedModel(PreTrainedModel):
-    config_class = QuestQwen3Config
+    config_class = LimQwen3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen3DecoderLayer"]
@@ -829,7 +728,7 @@ class Qwen3PreTrainedModel(PreTrainedModel):
 
 
 class Qwen3RotaryEmbedding(nn.Module):
-    def __init__(self, config: QuestQwen3Config, device=None):
+    def __init__(self, config: LimQwen3Config, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -863,7 +762,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 class Qwen3Model(Qwen3PreTrainedModel):
-    def __init__(self, config: QuestQwen3Config):
+    def __init__(self, config: LimQwen3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1074,7 +973,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         dtype: torch.dtype,
         cache_position: torch.Tensor,
         batch_size: int,
-        config: QuestQwen3Config,
+        config: LimQwen3Config,
         past_key_values: Cache,
     ):
         """
@@ -1094,7 +993,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 Indices depicting the position of the input sequence tokens in the sequence.
             batch_size (`torch.Tensor`):
                 Batch size.
-            config (`QuestQwen3Config`):
+            config (`LimQwen3Config`):
                 The model's configuration class
             past_key_values (`Cache`):
                 The cache class that is being used currently to generate
