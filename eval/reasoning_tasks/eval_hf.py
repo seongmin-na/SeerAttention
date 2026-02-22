@@ -359,17 +359,24 @@ def infer(args):
         if args.profile_sparsity:
             all_batch_sparsitys_info.append(batch_sparsitys_info)
 
+        input_padded_len = batch_input_ids.shape[1]
         for j in range(len(outputs)):
             output_seq = outputs[j]
-            
-            output_tokens = (output_seq != eos_token_id).sum().item()
-            prompt_tokens = (batch_input_ids[j] != eos_token_id).sum().item()
-            generate_lens.append(output_tokens - prompt_tokens)
 
-            if output_tokens <= args.token_budget:
+            # Slice off the input portion (left-padded to input_padded_len) and
+            # find the first EOS in the generated portion for this sample.
+            generated_part = output_seq[input_padded_len:]
+            eos_pos = (generated_part == eos_token_id).nonzero(as_tuple=True)[0]
+            gen_len = eos_pos[0].item() if len(eos_pos) > 0 else len(generated_part)
+            generate_lens.append(gen_len)
+
+            # actual_input_len excludes left-padding (uses original attention mask).
+            actual_input_len = attention_mask[j].sum().item()
+            total_tokens = actual_input_len + gen_len
+            if total_tokens <= args.token_budget:
                 quest_sparsitys.append(0)
             else:
-                sparsity = (1 - args.token_budget / output_tokens) * 100
+                sparsity = (1 - args.token_budget / total_tokens) * 100
                 quest_sparsitys.append(sparsity)
 
         batch_results = tokenizer.batch_decode(outputs, skip_special_tokens=True)
