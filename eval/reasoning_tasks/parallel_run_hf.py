@@ -82,6 +82,15 @@ if __name__ == "__main__":
 
     task_config = choose_task_config(args.model_size, output_dir)
 
+    # Respect SLURM's GPU allocation. SLURM sets CUDA_VISIBLE_DEVICES to the
+    # physical IDs of the GPUs assigned to this job (e.g. "2,5"). If we are not
+    # inside SLURM, fall back to 0..num_gpus-1.
+    slurm_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if slurm_visible:
+        allocated_gpus = slurm_visible.split(",")
+    else:
+        allocated_gpus = [str(i) for i in range(num_gpus)]
+
     for task in tasks:
         if task not in task_config:
             print(f"Error: Unknown task '{task}'")
@@ -162,7 +171,10 @@ if __name__ == "__main__":
                         print(f"Launching run {current_run_id} on GPU {gpu_id}...")
                         
                         env = os.environ.copy()
-                        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                        # Give each subprocess exactly one GPU (the one allocated
+                        # by SLURM for this slot). Inside the subprocess, that
+                        # GPU is always visible as cuda:0, so --rank is always 0.
+                        env["CUDA_VISIBLE_DEVICES"] = allocated_gpus[gpu_id % len(allocated_gpus)]
                         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
                         cmd = [
                             "python", "eval_hf.py",
@@ -175,7 +187,7 @@ if __name__ == "__main__":
                             "--use_batch_exist",
                             "--use_fused_kernel",
                             "--surround_with_messages",
-                            "--rank", str(gpu_id),
+                            "--rank", "0",
                             "--sparsity_method", sparsity_method,
                             "--block_size", str(block_size),
                             "--run_id", str(current_run_id),
